@@ -1,10 +1,12 @@
-
 name: Daily POS Sales Email Report
 
 on:
   schedule:
+    # 12:00 UTC = 21:00 KST (오후 9시 한국시간)
     - cron: '0 12 * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [send_report_now]
 
 jobs:
   send-report:
@@ -30,5 +32,6 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          CUTOFF_DATE: ${{ secrets.CUTOFF_DATE }}
         run: |
           python pos_report.py
