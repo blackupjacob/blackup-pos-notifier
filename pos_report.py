@@ -13,12 +13,15 @@ from collections import defaultdict
 # Set UTF-8 encoding
 sys.stdout.reconfigure(encoding='utf-8')
 
-# Environment variables (Set via GitHub Secrets or environment)
+# Environment variables
 POS_USER = os.environ.get('POS_USER', 'jacobriri')
 POS_PASS = os.environ.get('POS_PASS', '0406')
-SMTP_USER = os.environ.get('SMTP_USER')           # e.g., yourgmail@gmail.com
-SMTP_PASS = os.environ.get('SMTP_PASS')           # e.g., Gmail App Password (16 chars)
+SMTP_USER = os.environ.get('SMTP_USER')
+SMTP_PASS = os.environ.get('SMTP_PASS')
 RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
+
+# 수동 고정 날짜 (설정 안 되어있으면 자동 평일/주말 맞춤 계산)
+CUTOFF_DATE = os.environ.get('CUTOFF_DATE', '')
 
 def fetch_pos_data():
     cj = http.cookiejar.CookieJar()
@@ -35,13 +38,13 @@ def fetch_pos_data():
     )
     opener.open(req)
 
-    # 2. Fetch today's orders (9/11 ~ today)
+    # 2. Fetch orders (최근 7일치 넓게 조회 후 조건 필터링)
     list_url = 'https://pos.blackupcoffeewerk.com/api/orders/list'
-    # Current KST date
     now_kst = datetime.utcnow() + timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d')
+    fetch_start = (now_kst - timedelta(days=7)).strftime('%Y-%m-%d')
     
-    p = json.dumps({'channel': '', 'ship_status': '', 'date_from': '2026-09-11', 'date_to': today_str, 'q': ''}).encode('utf-8')
+    p = json.dumps({'channel': '', 'ship_status': '', 'date_from': fetch_start, 'date_to': today_str, 'q': ''}).encode('utf-8')
     r = urllib.request.Request(
         list_url,
         data=p,
@@ -54,8 +57,24 @@ def fetch_pos_data():
         return data.get('orders', []), now_kst
 
 def generate_report(orders, now_kst):
-    cutoff = '2026-09-11 09:00'
-    filtered = [o for o in orders if o.get('ordered_at', o.get('created_at', '')) >= cutoff]
+    # 요일 판단: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
+    weekday = now_kst.weekday()
+
+    if CUTOFF_DATE:
+        target_cutoff = CUTOFF_DATE
+        period_label = f"{target_cutoff} 이후 집계 (수동 지정)"
+    elif weekday in [5, 6]:  # 주말 (토요일, 일요일)
+        days_back = 1 if weekday == 5 else 2
+        fri_date = (now_kst - timedelta(days=days_back)).strftime('%Y-%m-%d')
+        target_cutoff = f"{fri_date} 09:00"
+        day_name = "토요일" if weekday == 5 else "일요일"
+        period_label = f"주말 누적 집계 (금요일 {fri_date} 09:00 ~ {day_name} 현재)"
+    else:  # 평일 (월~금)
+        today_str = now_kst.strftime('%Y-%m-%d')
+        target_cutoff = f"{today_str} 09:00"
+        period_label = f"평일 당일 집계 ({today_str} 09:00 ~ 현재)"
+
+    filtered = [o for o in orders if o.get('ordered_at', o.get('created_at', '')) >= target_cutoff]
 
     prod_stats = defaultdict(lambda: {'orders': 0, 'qty': 0, 'amount': 0, 'canc_qty': 0})
 
@@ -90,6 +109,7 @@ def generate_report(orders, now_kst):
             body {{ font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; color: #222; background-color: #f8f9fa; padding: 20px; }}
             .container {{ max-width: 680px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 28px; box-shadow: 0 4px 15px rgba(0,0,0,0.06); border: 1px solid #e1e4e8; }}
             h2 {{ color: #1a1a1a; font-size: 22px; border-bottom: 2px solid #1a1a1a; padding-bottom: 10px; margin-top: 0; }}
+            .badge {{ background-color: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 6px; font-size: 13px; font-weight: bold; display: inline-block; margin-bottom: 10px; }}
             .kpi-box {{ display: flex; gap: 12px; margin: 20px 0; }}
             .kpi-card {{ flex: 1; background: #f1f5f9; padding: 16px; border-radius: 8px; text-align: center; }}
             .kpi-title {{ font-size: 13px; color: #64748b; margin-bottom: 4px; }}
@@ -104,8 +124,9 @@ def generate_report(orders, now_kst):
     </head>
     <body>
         <div class="container">
-            <h2>☕ 블랙업커피 POS 일일 일괄집계 리포트</h2>
-            <p style="color:#64748b; font-size:13px;">집계 일시: {report_date_str} KST (오후 9시 클라우드 자동 발송)</p>
+            <h2>☕ 블랙업커피 POS 맞춤 판매집계 리포트</h2>
+            <p style="color:#64748b; font-size:13px; margin-bottom: 6px;">집계 일시: {report_date_str} KST</p>
+            <div><span class="badge">📅 {period_label}</span></div>
             
             <div class="kpi-box">
                 <div class="kpi-card">
@@ -122,7 +143,7 @@ def generate_report(orders, now_kst):
                 </div>
             </div>
 
-            <h3>📊 9/11 09:00 이후 품목별 주문 수량 순위</h3>
+            <h3>📊 품목별 주문 수량 순위 ({period_label})</h3>
             <table>
                 <thead>
                     <tr>
@@ -157,14 +178,14 @@ def generate_report(orders, now_kst):
 
             <div class="footer">
                 본 메일은 GitHub Actions 클라우드 스케줄러에 의해 자동으로 생성 및 발송되었습니다.<br>
-                컴퓨터 전원이 꺼져 있어도 설정된 시각(매일 오후 9시)에 자동 작동합니다.
+                평일: 당일 오전 09:00 이후 집계 | 주말: 금요일 오전 09:00 이후 누적 집계
             </div>
         </div>
     </body>
     </html>
     """
 
-    return html_body, f"☕ [블랙업커피 POS] 일일 일괄 판매 리포트 ({now_kst.strftime('%m/%d')} 21:00)"
+    return html_body, f"☕ [블랙업 POS] {period_label} 리포트"
 
 def send_email(subject, html_content):
     if not SMTP_USER or not SMTP_PASS:
@@ -189,7 +210,7 @@ def send_email(subject, html_content):
     print(f"[SUCCESS] Email report successfully sent to {recip}!")
 
 if __name__ == '__main__':
-    print("Starting Cloud Report Execution...")
+    print("Starting Cloud Report Execution with Custom Business Logic...")
     orders, now_kst = fetch_pos_data()
     print(f"Fetched {len(orders)} total orders from POS.")
     html_report, subject = generate_report(orders, now_kst)
