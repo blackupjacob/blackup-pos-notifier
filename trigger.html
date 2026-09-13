@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>☕ POS 리포트 즉시발송</title>
+    <link rel="apple-touch-icon" href="https://img.icons8.com/color/180/coffee-to-go.png">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #fff; text-align: center; padding: 40px 20px; }
+        .card { background: #1e293b; padding: 32px 24px; border-radius: 24px; max-width: 360px; margin: 40px auto 0; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #334155; }
+        .icon { font-size: 54px; margin-bottom: 12px; }
+        h2 { margin: 0 0 8px 0; font-size: 22px; color: #f8fafc; }
+        p { color: #94a3b8; font-size: 14px; margin: 0 0 24px 0; line-height: 1.5; }
+        .btn { background: #2563eb; color: #fff; border: 0; padding: 16px; border-radius: 14px; font-size: 17px; font-weight: bold; width: 100%; cursor: pointer; transition: background 0.2s; box-shadow: 0 4px 12px rgba(37,99,235,0.4); }
+        .btn:active { background: #1d4ed8; transform: scale(0.98); }
+        .status { margin-top: 20px; font-size: 14px; min-height: 24px; color: #94a3b8; word-break: break-all; }
+        .reset-link { display: inline-block; margin-top: 25px; color: #64748b; font-size: 12px; text-decoration: underline; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">☕</div>
+        <h2>블랙업 POS 리포트</h2>
+        <p>터치 한 번으로 최신 집계 리포트를 이메일로 즉시 발송합니다.</p>
+        <button class="btn" onclick="triggerReport()">✉️ 리포트 메일 즉시 발송</button>
+        <div class="status" id="status">버튼을 누르면 10초 내로 메일이 전송됩니다.</div>
+        <div class="reset-link" onclick="resetConfig()">설정 정보(아이디/토큰) 재입력하기</div>
+    </div>
+
+    <script>
+        async function triggerReport() {
+            const st = document.getElementById('status');
+            st.textContent = '🚀 클라우드에 메일 발송 요청 중...';
+            st.style.color = '#38bdf8';
+
+            let token = localStorage.getItem('gh_pat');
+            if(!token) {
+                token = prompt('발급받으신 GitHub Token (ghp_...)을 입력해주세요:');
+                if(!token) { st.textContent = '토큰이 입력되지 않았습니다.'; st.style.color = '#f87171'; return; }
+                localStorage.setItem('gh_pat', token.trim());
+            }
+
+            let user = localStorage.getItem('gh_user');
+            if(!user) {
+                user = prompt('GitHub 계정 아이디(Username)를 입력해주세요:');
+                if(!user) { st.textContent = '아이디가 입력되지 않았습니다.'; st.style.color = '#f87171'; return; }
+                localStorage.setItem('gh_user', user.trim());
+            }
+
+            try {
+                const res = await fetch(`https://api.github.com/repos/${user}/blackup-pos-notifier/dispatches`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `token ${token}`,
+                        'Accept': 'application/vnd.github.v3+json',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ event_type: 'send_report_now' })
+                });
+
+                if(res.ok || res.status === 204) {
+                    st.textContent = '✅ 발송 요청 성공! 10초 내 메일함으로 도착합니다.';
+                    st.style.color = '#4ade80';
+                } else {
+                    st.textContent = `❌ 발송 실패 (${res.status}: 아이디 또는 토큰 권한을 확인해주세요)`;
+                    st.style.color = '#f87171';
+                }
+            } catch(e) {
+                st.textContent = '오류 발생: ' + e.message;
+                st.style.color = '#f87171';
+            }
+        }
+
+        function resetConfig() {
+            localStorage.removeItem('gh_pat');
+            localStorage.removeItem('gh_user');
+            alert('설정 정보가 초기화되었습니다. 버튼을 누르면 다시 입력 창이 뜹니다.');
+        }
+    </script>
+</body>
+</html>
