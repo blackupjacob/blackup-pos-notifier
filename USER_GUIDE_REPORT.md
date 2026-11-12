@@ -9,7 +9,7 @@
 1. **로컬 PC vs 클라우드 서버**:
    - 사용자님의 컴퓨터는 밤에 꺼질 수 있지만, **GitHub(마이크로소프트의 글로벌 개발 플랫폼)**의 가상 서버는 365일 24시간 켜져 있습니다.
 2. **GitHub Actions 스케줄러**:
-   - 저희가 만든 파이썬 수집 코드와 설정 파일(`.github/workflows/daily_report.yml`)을 GitHub에 올려두면, **한국시간 매일 오후 9시 00분**에 GitHub 가상 컴퓨터가 알아서 깨어나 POS 데이터를 조회하고 이메일을 발송합니다.
+   - 저희가 만든 파이썬 수집 코드와 설정 파일(`.github/workflows/daily_report.yml`)을 GitHub에 올려두면, **한국시간 매일 오후 9시 무렵**에 GitHub 가상 컴퓨터가 알아서 깨어나 POS 데이터를 조회하고 이메일을 발송합니다.
 3. **보안 (GitHub Secrets)**:
    - POS 아이디/비밀번호, 메일 접속 비밀번호는 소스코드에 드러나지 않으며, GitHub의 암호화 저장소(Secrets)에 안전하게 보관됩니다.
 
@@ -18,7 +18,7 @@
 ## 🛠️ 2. AI가 자동으로 완성해 둔 항목 (자동 진행 리포트)
 
 - ✅ **`pos_report.py`**: POS 자동 로그인, 실시간 주문 데이터 수집, 취소건 분리, 9/11 이후 수량 집계, 모바일/PC 겸용 HTML 프리미엄 이메일 양식 자동 생성 코드 작성 완료
-- ✅ **`.github/workflows/daily_report.yml`**: 한국시간 오후 9시(`0 12 * * *` UTC) 정기 실행 및 수동 실행(Run workflow) 기능 탑재 완료
+- ✅ **`.github/workflows/daily_report.yml`**: 한국시간 오후 9시 무렵(`50 11 * * *` UTC, 20:50 KST 시작) 정기 실행 및 수동 실행(Run workflow) 기능 탑재 완료
 - ✅ **`requirements.txt`**: 파이썬 클라우드 실행 환경 설정 완료
 
 ---
@@ -38,7 +38,7 @@
 1. [github.com](https://github.com) 접속 및 로그인 (계정이 없다면 1분 가입)
 2. 우측 상단 **`+`** 버튼 -> **New repository** 클릭
 3. Repository name: `blackup-pos-notifier` 입력 후 **Create repository** 클릭
-4. 프로젝트 폴더(`C:\Users\jacob\.gemini\antigravity\scratch\blackup-pos-cloud-notifier`)의 파일들을 해당 저장소에 업로드합니다.
+4. 이 프로젝트 폴더의 파일들을 해당 저장소에 업로드합니다.
 
 ### [3단계] GitHub Secrets (비밀번호 저장소) 등록 (30초)
 새로 만든 GitHub 저장소 페이지에서:
@@ -47,8 +47,8 @@
 
 | Secret 이름 | 입력할 값 | 설명 |
 | :--- | :--- | :--- |
-| `POS_USER` | `jacobriri` | POS 아이디 |
-| `POS_PASS` | `0406` | POS 비밀번호 |
+| `POS_USER` | (POS 로그인 아이디) | POS 아이디. 값은 GitHub Secret에만 저장합니다. |
+| `POS_PASS` | (POS 로그인 비밀번호) | POS 비밀번호. 값은 GitHub Secret에만 저장합니다. |
 | `SMTP_USER` | `사용자님의Gmail@gmail.com` | 발신용 Gmail 주소 |
 | `SMTP_PASS` | `1단계에서 만든 16자리 앱비밀번호` | Gmail 앱 비밀번호 |
 | `RECIPIENT_EMAIL` | `리포트를 받을 이메일 주소` | 수신 메일 주소 |

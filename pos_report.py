@@ -13,9 +13,9 @@ from collections import defaultdict
 # Set UTF-8 encoding
 sys.stdout.reconfigure(encoding='utf-8')
 
-# Environment variables
-POS_USER = os.environ.get('POS_USER', 'jacobriri')
-POS_PASS = os.environ.get('POS_PASS', '0406')
+# Environment variables (GitHub Actions secrets; no credential defaults)
+POS_USER = os.environ.get('POS_USER')
+POS_PASS = os.environ.get('POS_PASS')
 SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASS = os.environ.get('SMTP_PASS')
 RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
@@ -24,6 +24,10 @@ RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
 CUTOFF_DATE = os.environ.get('CUTOFF_DATE', '')
 
 def fetch_pos_data():
+    if not (POS_USER or '').strip() or not (POS_PASS or '').strip():
+        print("[ERROR] POS_USER or POS_PASS environment variables are not set. Cannot log in to POS.")
+        sys.exit(1)
+
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
