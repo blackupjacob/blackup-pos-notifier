@@ -2,8 +2,10 @@ name: Daily POS Sales Email Report
 
 on:
   schedule:
-    # 12:00 UTC = 21:00 KST (오후 9시 한국시간)
-    - cron: '0 12 * * *'
+    # 11:50 UTC = 20:50 KST. Starts before the top of the hour so a
+    # typical Actions delay still delivers the mail around 21:00 KST.
+    # Midnight KST is 15:00 UTC, so this run stays on the same KST date.
+    - cron: '50 11 * * *'
   workflow_dispatch:
   repository_dispatch:
     types: [send_report_now]

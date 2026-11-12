@@ -1,0 +1,44 @@
+name: Keep daily report workflow enabled
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Monday 00:17 UTC, off the hour. Weekly re-enable of the sales-report workflow.
+    - cron: '17 0 * * 1'
+
+permissions:
+  actions: write
+
+jobs:
+  enable-daily-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-enable scheduled workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          enable_workflow() {
+            local workflow_file="$1"
+            local body_file
+            body_file="$(mktemp)"
+            local status
+            status="$(curl -sS -o "${body_file}" -w "%{http_code}" -X PUT \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${workflow_file}/enable")"
+            echo "enable ${workflow_file}: HTTP ${status}"
+            if [ "${status}" != "204" ]; then
+              cat "${body_file}"
+              rm -f "${body_file}"
+              exit 1
+            fi
+            rm -f "${body_file}"
+          }
+          # main.yml cannot re-enable itself while it is disabled_inactivity.
+          enable_workflow "main.yml"
+          enable_workflow "keepalive.yml"

@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import time
+import urllib.error
 import urllib.request
 import urllib.parse
 import http.cookiejar
@@ -13,9 +15,9 @@ from collections import defaultdict
 # Set UTF-8 encoding
 sys.stdout.reconfigure(encoding='utf-8')
 
-# Environment variables
-POS_USER = os.environ.get('POS_USER', 'jacobriri')
-POS_PASS = os.environ.get('POS_PASS', '0406')
+# Environment variables (GitHub Actions secrets; no credential defaults)
+POS_USER = os.environ.get('POS_USER')
+POS_PASS = os.environ.get('POS_PASS')
 SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASS = os.environ.get('SMTP_PASS')
 RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
@@ -23,38 +25,169 @@ RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
 # 수동 고정 날짜 (설정 안 되어있으면 자동 평일/주말 맞춤 계산)
 CUTOFF_DATE = os.environ.get('CUTOFF_DATE', '')
 
-def fetch_pos_data():
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+# 3 attempts. Waits of 2 min + 8 min sit between them, about 10 minutes total.
+POS_RETRY_ATTEMPTS = 3
+POS_RETRY_WAITS_SECONDS = (120, 480)
+POS_REQUEST_TIMEOUT = 60
 
-    # 1. Login
+class PosError(Exception):
+    def __init__(self, error_type):
+        self.error_type = error_type
+        super().__init__(error_type)
+
+def now_kst_now():
+    return datetime.utcnow() + timedelta(hours=9)
+
+def _header_value(headers, name):
+    if headers is None:
+        return ''
+    getter = getattr(headers, 'get', None)
+    if getter is None:
+        return ''
+    value = getter(name)
+    if value:
+        return value
+    return getter(name.lower()) or ''
+
+def _looks_like_html(content_type, body_text):
+    ctype = (content_type or '').lower()
+    sample = body_text.lstrip()[:40].lower()
+    return 'text/html' in ctype or sample.startswith('<!doctype') or sample.startswith('<html')
+
+def _http_error_type(code, body):
+    if code == 530:
+        snippet = body[:1000].decode('utf-8', errors='replace')
+        if '1033' in snippet:
+            return 'POS server 530 (Cloudflare 1033)'
+        return 'POS server 530'
+    return f'POS server {code}'
+
+def _connection_error_type(exc):
+    reason = getattr(exc, 'reason', exc)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return 'POS connection timeout'
+    text = str(reason).lower()
+    if 'timed out' in text or 'timeout' in text:
+        return 'POS connection timeout'
+    return 'POS connection error'
+
+def _nonempty_cookie(cookie_jar):
+    for cookie in cookie_jar:
+        if (cookie.value or '').strip():
+            return True
+    return False
+
+def _set_cookie_has_value(headers):
+    lines = []
+    if headers is not None and hasattr(headers, 'get_all'):
+        lines = headers.get_all('Set-Cookie') or []
+    else:
+        raw = _header_value(headers, 'Set-Cookie')
+        if raw:
+            lines = [raw]
+    for line in lines:
+        pair = line.split(';', 1)[0]
+        if '=' not in pair:
+            continue
+        _name, value = pair.split('=', 1)
+        if value.strip():
+            return True
+    return False
+
+def _read_response(opener, request, purpose, sleep):
+    last_type = 'POS connection error'
+    for attempt in range(1, POS_RETRY_ATTEMPTS + 1):
+        try:
+            with opener.open(request, timeout=POS_REQUEST_TIMEOUT) as resp:
+                status = resp.getcode() if hasattr(resp, 'getcode') else resp.status
+                return status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read() if exc.fp is not None else b''
+            except OSError:
+                body = b''
+            if exc.code >= 500:
+                last_type = _http_error_type(exc.code, body)
+                print(f"[WARN] {purpose} failed ({last_type}), attempt {attempt}/{POS_RETRY_ATTEMPTS}")
+            else:
+                return exc.code, exc.headers, body
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_type = _connection_error_type(exc)
+            print(f"[WARN] {purpose} failed ({last_type}), attempt {attempt}/{POS_RETRY_ATTEMPTS}")
+        if attempt < POS_RETRY_ATTEMPTS:
+            sleep(POS_RETRY_WAITS_SECONDS[attempt - 1])
+    raise PosError(last_type)
+
+def _assert_login(_status, headers, body, cookie_jar):
+    text = body.decode('utf-8', errors='replace')
+    if _looks_like_html(_header_value(headers, 'Content-Type'), text):
+        raise PosError('POS login failed: login page')
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        raise PosError('POS login failed: login page')
+    if not isinstance(data, dict) or not data.get('ok'):
+        raise PosError('POS login failed')
+    for key in ('token', 'access_token', 'session'):
+        if key not in data or data.get(key) is None:
+            continue
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise PosError('POS login failed: empty token')
+        return
+    if not _nonempty_cookie(cookie_jar) and not _set_cookie_has_value(headers):
+        raise PosError('POS login failed: empty token')
+
+def _parse_orders(status, headers, body):
+    text = body.decode('utf-8', errors='replace')
+    if status >= 400 or _looks_like_html(_header_value(headers, 'Content-Type'), text):
+        if _looks_like_html(_header_value(headers, 'Content-Type'), text):
+            raise PosError('POS login failed: login page')
+        raise PosError(f'POS data fetch failed (HTTP {status})')
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        raise PosError('POS data fetch failed')
+    if not isinstance(data, dict) or 'orders' not in data:
+        raise PosError('POS data fetch failed')
+    orders = data['orders']
+    if not isinstance(orders, list):
+        raise PosError('POS data fetch failed')
+    return orders
+
+def fetch_pos_data(opener=None, sleep=time.sleep, cookie_jar=None):
+    if not (POS_USER or '').strip() or not (POS_PASS or '').strip():
+        raise PosError('POS_USER or POS_PASS environment variables are not set. Cannot log in to POS.')
+
+    jar = cookie_jar if cookie_jar is not None else http.cookiejar.CookieJar()
+    if opener is None:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
     login_url = 'https://pos.blackupcoffeewerk.com/login'
     payload = json.dumps({'username': POS_USER, 'password': POS_PASS, 'remember': True}).encode('utf-8')
-    req = urllib.request.Request(
+    login_req = urllib.request.Request(
         login_url,
         data=payload,
         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Content-Type': 'application/json'},
         method='POST'
     )
-    opener.open(req)
+    status, headers, body = _read_response(opener, login_req, 'POS login', sleep)
+    _assert_login(status, headers, body, jar)
 
-    # 2. Fetch orders (최근 7일치 넓게 조회 후 조건 필터링)
+    # 최근 7일치 넓게 조회 후 조건 필터링
     list_url = 'https://pos.blackupcoffeewerk.com/api/orders/list'
-    now_kst = datetime.utcnow() + timedelta(hours=9)
+    now_kst = now_kst_now()
     today_str = now_kst.strftime('%Y-%m-%d')
     fetch_start = (now_kst - timedelta(days=7)).strftime('%Y-%m-%d')
-    
-    p = json.dumps({'channel': '', 'ship_status': '', 'date_from': fetch_start, 'date_to': today_str, 'q': ''}).encode('utf-8')
-    r = urllib.request.Request(
+    list_payload = json.dumps({'channel': '', 'ship_status': '', 'date_from': fetch_start, 'date_to': today_str, 'q': ''}).encode('utf-8')
+    list_req = urllib.request.Request(
         list_url,
-        data=p,
+        data=list_payload,
         headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json'},
         method='POST'
     )
-    
-    with opener.open(r) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-        return data.get('orders', []), now_kst
+    status, headers, body = _read_response(opener, list_req, 'POS order fetch', sleep)
+    return _parse_orders(status, headers, body), now_kst
 
 def generate_report(orders, now_kst):
     # 요일 판단: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
@@ -100,6 +233,12 @@ def generate_report(orders, now_kst):
 
     sorted_prods = sorted(prod_stats.items(), key=lambda x: x[1]['qty'], reverse=True)
     report_date_str = now_kst.strftime('%Y년 %m월 %d일 %H:%M')
+    if filtered:
+        warning_html = ''
+        subject = f"☕ [블랙업 POS] {period_label} 리포트"
+    else:
+        warning_html = '<div class="warn">경고: 집계 구간에서 주문이 0건입니다. POS 데이터를 확인하세요.</div>'
+        subject = f"⚠ [블랙업 POS] 주문 0건 — POS 데이터를 확인하세요 | {period_label}"
 
     # HTML Email Body
     html_body = f"""
@@ -119,11 +258,13 @@ def generate_report(orders, now_kst):
             td {{ padding: 10px; border-bottom: 1px solid #e2e8f0; }}
             tr:nth-child(even) {{ background-color: #f8fafc; }}
             .highlight {{ color: #2563eb; font-weight: bold; }}
+            .warn {{ background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; padding: 12px 14px; border-radius: 8px; font-weight: bold; margin: 0 0 16px 0; }}
             .footer {{ margin-top: 30px; font-size: 12px; color: #94a3b8; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 15px; }}
         </style>
     </head>
     <body>
         <div class="container">
+            {warning_html}
             <h2>☕ 블랙업커피 POS 맞춤 판매집계 리포트</h2>
             <p style="color:#64748b; font-size:13px; margin-bottom: 6px;">집계 일시: {report_date_str} KST</p>
             <div><span class="badge">📅 {period_label}</span></div>
@@ -185,33 +326,76 @@ def generate_report(orders, now_kst):
     </html>
     """
 
-    return html_body, f"☕ [블랙업 POS] {period_label} 리포트"
+    return html_body, subject
 
-def send_email(subject, html_content):
+def _recipient():
+    return RECIPIENT_EMAIL if RECIPIENT_EMAIL else SMTP_USER
+
+def _deliver(subject, body, subtype):
     if not SMTP_USER or not SMTP_PASS:
         print("[ERROR] SMTP_USER or SMTP_PASS environment variables are not set. Cannot send email.")
-        sys.exit(1)
+        raise PosError('SMTP credentials missing')
 
-    recip = RECIPIENT_EMAIL if RECIPIENT_EMAIL else SMTP_USER
-
+    recip = _recipient()
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = f"블랙업 POS 자동 리포트 <{SMTP_USER}>"
     msg['To'] = recip
 
-    part = MIMEText(html_content, 'html', 'utf-8')
+    part = MIMEText(body, subtype, 'utf-8')
     msg.attach(part)
 
-    print(f"Connecting to Gmail SMTP server (smtp.gmail.com:587)...")
-    with smtplib.SMTP('smtp.gmail.com', 587) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, recip, msg.as_string())
+    print("Connecting to Gmail SMTP server (smtp.gmail.com:587)...")
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, recip, msg.as_string())
+    except PosError:
+        raise
+    except Exception as exc:
+        print(f"[ERROR] Email send failed ({type(exc).__name__}).")
+        raise PosError('email send failed')
+    return recip
+
+def send_email(subject, html_content):
+    recip = _deliver(subject, html_content, 'html')
     print(f"[SUCCESS] Email report successfully sent to {recip}!")
 
-if __name__ == '__main__':
+def send_failure_email(error_type, when_kst):
+    if not SMTP_USER or not SMTP_PASS:
+        print("[ERROR] SMTP_USER or SMTP_PASS environment variables are not set. Cannot send email.")
+        return
+    when_text = when_kst.strftime('%Y-%m-%d %H:%M KST')
+    subject = f"[블랙업 POS] 리포트 실패: {error_type}"
+    body = (
+        "블랙업 POS 자동 리포트가 실패했습니다.\n"
+        f"오류 유형: {error_type}\n"
+        f"실행 시각: {when_text}\n"
+    )
+    try:
+        recip = _deliver(subject, body, 'plain')
+    except PosError:
+        print("[ERROR] Failure email could not be sent.")
+        return
+    print(f"[WARN] Failure email sent to {recip}.")
+
+def run():
     print("Starting Cloud Report Execution with Custom Business Logic...")
-    orders, now_kst = fetch_pos_data()
-    print(f"Fetched {len(orders)} total orders from POS.")
-    html_report, subject = generate_report(orders, now_kst)
-    send_email(subject, html_report)
+    try:
+        orders, now_kst = fetch_pos_data()
+        print(f"Fetched {len(orders)} total orders from POS.")
+        html_report, subject = generate_report(orders, now_kst)
+        send_email(subject, html_report)
+        return 0
+    except PosError as exc:
+        print(f"[ERROR] {exc.error_type}")
+        send_failure_email(exc.error_type, now_kst_now())
+        return 1
+    except Exception:
+        print("[ERROR] POS report error")
+        send_failure_email('POS report error', now_kst_now())
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(run())
