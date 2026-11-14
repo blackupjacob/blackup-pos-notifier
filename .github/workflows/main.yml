@@ -2,17 +2,41 @@ name: Daily POS Sales Email Report
 
 on:
   schedule:
-    # 11:50 UTC = 20:50 KST. Starts before the top of the hour so a
-    # typical Actions delay still delivers the mail around 21:00 KST.
-    # Midnight KST is 15:00 UTC, so this run stays on the same KST date.
-    - cron: '50 11 * * *'
+    # GitHub creates this repo's schedule runs 2.5–9.7 hours after the cron
+    # minute (measured Oct 15–Nov 13 2026; the job itself finishes in seconds).
+    # These slots are spaced so that, across that delay range, one run starts
+    # in the five hours before 21:00 KST and waits. The others no-op.
+    - cron: '15 2 * * *'
+    - cron: '15 5 * * *'
+    - cron: '15 8 * * *'
+    - cron: '15 11 * * *'
   workflow_dispatch:
+    inputs:
+      report_date:
+        description: 'KST date to send now (YYYY-MM-DD). Empty uses today after 09:00, otherwise yesterday.'
+        required: false
+        type: string
+      force:
+        description: 'Send again even if this KST date was already emailed'
+        required: false
+        type: boolean
+        default: false
   repository_dispatch:
     types: [send_report_now]
+
+# One sender at a time so two slots cannot both miss the marker and email twice.
+concurrency:
+  group: pos-daily-report
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   send-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -34,6 +58,28 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          CUTOFF_DATE: ${{ secrets.CUTOFF_DATE }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPORT_MODE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
+          REPORT_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.report_date || '' }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && inputs.force && 'true' || 'false' }}
         run: |
           python pos_report.py
+
+      - name: Read sent date
+        id: sent
+        if: success()
+        run: |
+          if [ -f .report-sent/date.txt ]; then
+            echo "date=$(tr -d '[:space:]' < .report-sent/date.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "date=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record sent date
+        if: success() && steps.sent.outputs.date != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pos-report-sent-${{ steps.sent.outputs.date }}
+          path: .report-sent/date.txt
+          retention-days: 90

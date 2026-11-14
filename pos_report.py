@@ -22,9 +22,6 @@ SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASS = os.environ.get('SMTP_PASS')
 RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', SMTP_USER)
 
-# 수동 고정 날짜 (설정 안 되어있으면 자동 평일/주말 맞춤 계산)
-CUTOFF_DATE = os.environ.get('CUTOFF_DATE', '')
-
 # 3 attempts. Waits of 2 min + 8 min sit between them, about 10 minutes total.
 POS_RETRY_ATTEMPTS = 3
 POS_RETRY_WAITS_SECONDS = (120, 480)
@@ -189,25 +186,104 @@ def fetch_pos_data(opener=None, sleep=time.sleep, cookie_jar=None):
     status, headers, body = _read_response(opener, list_req, 'POS order fetch', sleep)
     return _parse_orders(status, headers, body), now_kst
 
-def generate_report(orders, now_kst):
-    # 요일 판단: 0=월, 1=화, 2=수, 3=목, 4=금, 5=토, 6=일
-    weekday = now_kst.weekday()
+# Daily mail is due at 21:00 KST. A run that starts in the five hours before
+# that waits. A run that starts earlier is the previous date's late delivery.
+SEND_AT_HOUR = 21
+LEAD_HOURS = 5
+SENT_MARKER = os.path.join('.report-sent', 'date.txt')
 
-    if CUTOFF_DATE:
-        target_cutoff = CUTOFF_DATE
-        period_label = f"{target_cutoff} 이후 집계 (수동 지정)"
-    elif weekday in [5, 6]:  # 주말 (토요일, 일요일)
-        days_back = 1 if weekday == 5 else 2
-        fri_date = (now_kst - timedelta(days=days_back)).strftime('%Y-%m-%d')
-        target_cutoff = f"{fri_date} 09:00"
-        day_name = "토요일" if weekday == 5 else "일요일"
-        period_label = f"주말 누적 집계 (금요일 {fri_date} 09:00 ~ {day_name} 현재)"
-    else:  # 평일 (월~금)
-        today_str = now_kst.strftime('%Y-%m-%d')
-        target_cutoff = f"{today_str} 09:00"
-        period_label = f"평일 당일 집계 ({today_str} 09:00 ~ 현재)"
+def report_plan(now_kst):
+    send_at = now_kst.replace(hour=SEND_AT_HOUR, minute=0, second=0, microsecond=0)
+    window_open = send_at - timedelta(hours=LEAD_HOURS)
+    if now_kst >= window_open:
+        business_date = now_kst.date()
+        wait_seconds = max(0, int((send_at - now_kst).total_seconds()))
+    else:
+        business_date = now_kst.date() - timedelta(days=1)
+        wait_seconds = 0
+    return business_date, wait_seconds
 
-    filtered = [o for o in orders if o.get('ordered_at', o.get('created_at', '')) >= target_cutoff]
+def resolve_plan(now_kst, mode, report_date_text):
+    text = (report_date_text or '').strip()
+    if text:
+        business_date = datetime.strptime(text, '%Y-%m-%d').date()
+        return business_date, 0
+    business_date, wait_seconds = report_plan(now_kst)
+    if mode != 'schedule':
+        if now_kst.hour >= 9:
+            business_date = now_kst.date()
+        return business_date, 0
+    return business_date, wait_seconds
+
+def sales_window(business_date, now_kst):
+    start = f"{business_date.isoformat()} 09:00"
+    end = f"{(business_date + timedelta(days=1)).isoformat()} 00:00"
+    if now_kst.date() == business_date:
+        end_label = now_kst.strftime('%H:%M')
+        if end_label < '09:00':
+            end_label = '09:00'
+    else:
+        end_label = '24:00'
+    period_label = f"{business_date.isoformat()} 당일 집계 (09:00~{end_label})"
+    return start, end, period_label
+
+def _order_stamp(order):
+    return order.get('ordered_at', order.get('created_at', '')) or ''
+
+def current_mode():
+    mode = (os.environ.get('REPORT_MODE') or '').strip().lower()
+    if mode in ('schedule', 'manual'):
+        return mode
+    if os.environ.get('GITHUB_EVENT_NAME') == 'schedule':
+        return 'schedule'
+    return 'manual'
+
+def artifact_name(business_date):
+    return f"pos-report-sent-{business_date.isoformat()}"
+
+def already_sent(business_date):
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    repo = os.environ.get('GITHUB_REPOSITORY')
+    if not token or not repo:
+        return False
+    url = (
+        f"https://api.github.com/repos/{repo}/actions/artifacts"
+        f"?name={artifact_name(business_date)}&per_page=1"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2026-03-10',
+            'User-Agent': 'blackup-pos-notifier',
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        print(f"[WARN] Could not check the sent marker ({type(exc).__name__}).")
+        return False
+    return int(data.get('total_count') or 0) > 0
+
+def write_sent_marker(business_date):
+    os.makedirs(os.path.dirname(SENT_MARKER), exist_ok=True)
+    with open(SENT_MARKER, 'w', encoding='utf-8') as handle:
+        handle.write(business_date.isoformat() + '\n')
+
+def should_record(now_kst, business_date, mode):
+    if mode == 'schedule':
+        return True
+    send_at = datetime.combine(business_date, datetime.min.time()).replace(hour=SEND_AT_HOUR)
+    return now_kst >= send_at
+
+def generate_report(orders, now_kst, business_date=None):
+    if business_date is None:
+        business_date, _wait = report_plan(now_kst)
+    start, end, period_label = sales_window(business_date, now_kst)
+
+    filtered = [o for o in orders if start <= _order_stamp(o) < end]
 
     prod_stats = defaultdict(lambda: {'orders': 0, 'qty': 0, 'amount': 0, 'canc_qty': 0})
 
@@ -319,7 +395,7 @@ def generate_report(orders, now_kst):
 
             <div class="footer">
                 본 메일은 GitHub Actions 클라우드 스케줄러에 의해 자동으로 생성 및 발송되었습니다.<br>
-                평일: 당일 오전 09:00 이후 집계 | 주말: 금요일 오전 09:00 이후 누적 집계
+                요일과 상관없이 해당 날짜 09:00~24:00 KST 매출만 집계합니다.
             </div>
         </div>
     </body>
@@ -380,13 +456,46 @@ def send_failure_email(error_type, when_kst):
         return
     print(f"[WARN] Failure email sent to {recip}.")
 
-def run():
+def _force_send():
+    return (os.environ.get('FORCE_SEND') or '').strip().lower() in ('1', 'true', 'yes')
+
+def run(now=None, sleep=time.sleep, already_sent_fn=None, mode=None, report_date_text=None, force=None):
     print("Starting Cloud Report Execution with Custom Business Logic...")
+    now_kst = now if now is not None else now_kst_now()
+    if not (POS_USER or '').strip() or not (POS_PASS or '').strip():
+        error_type = 'POS_USER or POS_PASS environment variables are not set. Cannot log in to POS.'
+        print(f"[ERROR] {error_type}")
+        send_failure_email(error_type, now_kst)
+        return 1
+    mode = mode if mode is not None else current_mode()
+    if report_date_text is None:
+        report_date_text = os.environ.get('REPORT_DATE', '')
+    if force is None:
+        force = _force_send()
     try:
-        orders, now_kst = fetch_pos_data()
-        print(f"Fetched {len(orders)} total orders from POS.")
-        html_report, subject = generate_report(orders, now_kst)
+        business_date, wait_seconds = resolve_plan(now_kst, mode, report_date_text)
+    except ValueError:
+        print("[ERROR] REPORT_DATE must be YYYY-MM-DD.")
+        return 1
+    checker = already_sent_fn if already_sent_fn is not None else already_sent
+    if not force and checker(business_date):
+        print(f"[SKIP] Report for {business_date.isoformat()} was already sent.")
+        return 0
+    if wait_seconds > 0:
+        print(f"[WAIT] Report date {business_date.isoformat()}. Sleeping {wait_seconds} seconds until 21:00 KST.")
+        sleep(wait_seconds)
+        now_kst = now_kst + timedelta(seconds=wait_seconds)
+        if not force and checker(business_date):
+            print(f"[SKIP] Report for {business_date.isoformat()} was already sent.")
+            return 0
+    try:
+        orders, fetched_at = fetch_pos_data()
+        label_now = now_kst if now is not None else fetched_at
+        print(f"Fetched {len(orders)} total orders from POS. Report date {business_date.isoformat()}.")
+        html_report, subject = generate_report(orders, label_now, business_date=business_date)
         send_email(subject, html_report)
+        if should_record(label_now, business_date, mode):
+            write_sent_marker(business_date)
         return 0
     except PosError as exc:
         print(f"[ERROR] {exc.error_type}")
