@@ -6,7 +6,7 @@ import subprocess
 import sys
 import unittest
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.header import decode_header
 from email.message import Message
 from http.cookiejar import Cookie, CookieJar
@@ -137,7 +137,6 @@ class ReportBehaviorTest(unittest.TestCase):
         self._smtp_user = pos_report.SMTP_USER
         self._smtp_pass = pos_report.SMTP_PASS
         self._recipient = pos_report.RECIPIENT_EMAIL
-        self._cutoff = pos_report.CUTOFF_DATE
         self._fetch = pos_report.fetch_pos_data
         self._smtp = pos_report.smtplib.SMTP
         self._now = pos_report.now_kst_now
@@ -146,7 +145,6 @@ class ReportBehaviorTest(unittest.TestCase):
         pos_report.SMTP_USER = 'sender@example.com'
         pos_report.SMTP_PASS = SMTP_PASSWORD
         pos_report.RECIPIENT_EMAIL = 'owner@example.com'
-        pos_report.CUTOFF_DATE = ''
         CaptureSMTP.instances = []
         pos_report.smtplib.SMTP = CaptureSMTP
 
@@ -156,10 +154,12 @@ class ReportBehaviorTest(unittest.TestCase):
         pos_report.SMTP_USER = self._smtp_user
         pos_report.SMTP_PASS = self._smtp_pass
         pos_report.RECIPIENT_EMAIL = self._recipient
-        pos_report.CUTOFF_DATE = self._cutoff
         pos_report.fetch_pos_data = self._fetch
         pos_report.smtplib.SMTP = self._smtp
         pos_report.now_kst_now = self._now
+        marker = os.path.join('.report-sent', 'date.txt')
+        if os.path.exists(marker):
+            os.remove(marker)
 
     def test_retries_530_then_succeeds_with_ten_minute_backoff(self):
         cloudflare = http_error(LOGIN_URL, 530, '<html>error code: 1033</html>')
@@ -268,7 +268,8 @@ class ReportBehaviorTest(unittest.TestCase):
             'amount': 2000,
         }
         pos_report.fetch_pos_data = lambda: ([outside], when)
-        code = pos_report.run()
+        pos_report.now_kst_now = lambda: when
+        code = pos_report.run(sleep=lambda _seconds: None, already_sent_fn=lambda _date: False, mode='schedule')
         self.assertEqual(code, 0)
         self.assertEqual(len(CaptureSMTP.instances), 1)
         subject, body = decoded_mail(CaptureSMTP.instances[0].messages[0][2])
@@ -287,8 +288,91 @@ class ReportBehaviorTest(unittest.TestCase):
             'amount': 1000,
         }
         _html, subject = pos_report.generate_report([inside], when)
-        self.assertEqual(subject, '☕ [블랙업 POS] 평일 당일 집계 (2026-11-12 09:00 ~ 현재) 리포트')
+        self.assertEqual(subject, '☕ [블랙업 POS] 2026-11-12 당일 집계 (09:00~21:00) 리포트')
         self.assertNotIn('0건', subject)
+        self.assertNotIn('주말 누적', subject)
+
+    def test_late_saturday_run_keeps_friday_same_day_window(self):
+        started = datetime(2026, 11, 14, 3, 48, 30)
+        business_date, wait_seconds = pos_report.report_plan(started)
+        self.assertEqual(business_date.isoformat(), '2026-11-13')
+        self.assertEqual(wait_seconds, 0)
+        orders = [
+            {'ordered_at': '2026-11-13 08:30', 'product': '이른원두', 'qty': 1, 'amount': 1000},
+            {'ordered_at': '2026-11-13 10:00', 'product': '원두', 'qty': 2, 'amount': 4000},
+            {'ordered_at': '2026-11-13 22:40', 'product': '디카페인', 'qty': 1, 'amount': 3000},
+            {'ordered_at': '2026-11-14 01:10', 'product': '새벽원두', 'qty': 9, 'amount': 9000},
+        ]
+        html, subject = pos_report.generate_report(orders, started, business_date=business_date)
+        self.assertIn('2026-11-13 당일 집계 (09:00~24:00)', subject)
+        self.assertNotIn('주말 누적', subject)
+        self.assertIn('원두', html)
+        self.assertIn('디카페인', html)
+        self.assertNotIn('이른원두', html)
+        self.assertNotIn('새벽원두', html)
+        self.assertNotIn('9개', html)
+
+    def test_schedule_waits_until_2100_and_skips_a_duplicate(self):
+        waits = []
+        fetched = []
+
+        def fetch():
+            fetched.append(True)
+            return ([], datetime(2026, 11, 13, 21, 0))
+
+        pos_report.fetch_pos_data = fetch
+        code = pos_report.run(
+            now=datetime(2026, 11, 13, 20, 0),
+            sleep=waits.append,
+            already_sent_fn=lambda _date: False,
+            mode='schedule',
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(waits, [3600])
+        self.assertEqual(fetched, [True])
+        subject, _body = decoded_mail(CaptureSMTP.instances[0].messages[0][2])
+        self.assertIn('2026-11-13 당일 집계 (09:00~21:00)', subject)
+
+        def fail_if_fetched():
+            fetched.append('again')
+            raise AssertionError('duplicate run fetched POS data')
+
+        pos_report.fetch_pos_data = fail_if_fetched
+        duplicate = pos_report.run(
+            now=datetime(2026, 11, 14, 3, 48),
+            sleep=waits.append,
+            already_sent_fn=lambda date: date.isoformat() == '2026-11-13',
+            mode='schedule',
+        )
+        self.assertEqual(duplicate, 0)
+        self.assertEqual(fetched, [True])
+        self.assertEqual(len(CaptureSMTP.instances[0].messages), 1)
+
+    def test_window_edges_around_1600_and_2100(self):
+        business_date, wait_seconds = pos_report.report_plan(datetime(2026, 11, 14, 14, 15))
+        self.assertEqual(business_date.isoformat(), '2026-11-13')
+        self.assertEqual(wait_seconds, 0)
+        business_date, wait_seconds = pos_report.report_plan(datetime(2026, 11, 14, 17, 0))
+        self.assertEqual(business_date.isoformat(), '2026-11-14')
+        self.assertEqual(wait_seconds, 4 * 3600)
+        business_date, wait_seconds = pos_report.report_plan(datetime(2026, 11, 13, 21, 30))
+        self.assertEqual(business_date.isoformat(), '2026-11-13')
+        self.assertEqual(wait_seconds, 0)
+
+    def test_observed_schedule_delays_still_target_the_same_kst_date(self):
+        # Slots are UTC hour:15. Delays are the min, median, and max measured
+        # from the 30 schedule runs between 2026-10-15 and 2026-11-13.
+        slots = (2, 5, 8, 11)
+        for delay_hours in (2.54, 5.35, 9.68):
+            hits = []
+            for hour in slots:
+                start_utc = datetime(2026, 11, 13, hour, 15) + timedelta(hours=delay_hours)
+                start_kst = start_utc + timedelta(hours=9)
+                business_date, wait_seconds = pos_report.report_plan(start_kst)
+                if business_date.isoformat() == '2026-11-13' and wait_seconds <= 5 * 3600:
+                    if start_kst.hour > 15 or (start_kst.hour == 16 and wait_seconds <= 5 * 3600):
+                        hits.append(hour)
+            self.assertTrue(hits, delay_hours)
 
     def test_failure_email_then_nonzero_exit(self):
         def fail_fetch():
@@ -296,7 +380,7 @@ class ReportBehaviorTest(unittest.TestCase):
 
         pos_report.fetch_pos_data = fail_fetch
         pos_report.now_kst_now = lambda: datetime(2026, 11, 12, 21, 5)
-        code = pos_report.run()
+        code = pos_report.run(sleep=lambda _seconds: None, already_sent_fn=lambda _date: False, mode='schedule')
         self.assertEqual(code, 1)
         subject, body = decoded_mail(CaptureSMTP.instances[0].messages[0][2])
         self.assertIn('리포트 실패', subject)
